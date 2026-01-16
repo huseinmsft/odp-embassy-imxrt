@@ -1,22 +1,21 @@
 /// I2C Master Driver
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
 use core::sync::atomic::Ordering;
 use core::task::Poll;
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_hal_internal::drop::OnDrop;
 use itertools::Itertools;
 
 use super::{
-    force_clear_remediation, wait_remediation_complete, Async, Blocking, Error, Info, Instance, InterruptHandler,
-    MasterDma, Mode, Result, SclPin, SdaPin, TransferError, I2C_REMEDIATION, I2C_WAKERS, REMEDIATON_MASTER_STOP,
-    TEN_BIT_PREFIX,
+    Async, Blocking, Error, Info, Instance, InterruptHandler, MasterDma, Mode, REMEDIATON_MASTER_STOP, Result, SclPin,
+    SdaPin, TEN_BIT_PREFIX, TransferError, force_clear_remediation, wait_remediation_complete,
 };
 use crate::flexcomm::FlexcommRef;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::i2c0::msttime::{Mstsclhigh, Mstscllow};
-use crate::{dma, interrupt, Peri};
+use crate::{Peri, dma, interrupt};
 
 /// Bus speed (nominal SCL, no clock stretching)
 #[derive(Clone, Copy)]
@@ -34,12 +33,10 @@ pub enum Speed {
     High,
 }
 
-/// Divide integers rounding to the nearest whole number rather than always down
-fn rounded_divide(numerator: u32, denominator: u32) -> u32 {
-    (numerator + denominator / 2) / denominator
-}
-
+/// Compute target duty cycle based on the specified hi/lo clock counts.
 fn get_duty_cycle(hi_clocks: u8, lo_clocks: u8) -> u8 {
+    assert!((MIN_CLOCKS..=MAX_CLOCKS).contains(&hi_clocks));
+    assert!((MIN_CLOCKS..=MAX_CLOCKS).contains(&lo_clocks));
     let total_clocks = u16::from(hi_clocks + lo_clocks);
     (100 * u16::from(hi_clocks) / total_clocks) as u8
 }
@@ -52,41 +49,44 @@ fn get_freq_hz(hi_clocks: u8, lo_clocks: u8, clock_div_multiplier: u16, clock_sp
 // neither the type nor the trait are defined in our crate.  Therefore, we define this Into-like trait and
 // use that instead.
 //
-trait IntoClocksEnum<DestT> {
-    fn into_clocks_enum(&self) -> DestT;
+trait ToClocksEnum<DestT>: Sized {
+    type Error;
+    fn to_clocks_enum(self) -> Result<DestT>;
 }
 
 const MIN_CLOCKS: u8 = 2;
 const MAX_CLOCKS: u8 = 9;
 
-impl IntoClocksEnum<Mstscllow> for u8 {
-    fn into_clocks_enum(&self) -> Mstscllow {
-        match *self {
-            2 => Mstscllow::Clocks2,
-            3 => Mstscllow::Clocks3,
-            4 => Mstscllow::Clocks4,
-            5 => Mstscllow::Clocks5,
-            6 => Mstscllow::Clocks6,
-            7 => Mstscllow::Clocks7,
-            8 => Mstscllow::Clocks8,
-            9 => Mstscllow::Clocks9,
-            _ => panic!("Invalid value for Mstscllow"),
+impl ToClocksEnum<Mstscllow> for u8 {
+    type Error = Error;
+    fn to_clocks_enum(self) -> Result<Mstscllow> {
+        match self {
+            2 => Ok(Mstscllow::Clocks2),
+            3 => Ok(Mstscllow::Clocks3),
+            4 => Ok(Mstscllow::Clocks4),
+            5 => Ok(Mstscllow::Clocks5),
+            6 => Ok(Mstscllow::Clocks6),
+            7 => Ok(Mstscllow::Clocks7),
+            8 => Ok(Mstscllow::Clocks8),
+            9 => Ok(Mstscllow::Clocks9),
+            _ => Err(Error::UnsupportedConfiguration),
         }
     }
 }
 
-impl IntoClocksEnum<Mstsclhigh> for u8 {
-    fn into_clocks_enum(&self) -> Mstsclhigh {
-        match *self {
-            2 => Mstsclhigh::Clocks2,
-            3 => Mstsclhigh::Clocks3,
-            4 => Mstsclhigh::Clocks4,
-            5 => Mstsclhigh::Clocks5,
-            6 => Mstsclhigh::Clocks6,
-            7 => Mstsclhigh::Clocks7,
-            8 => Mstsclhigh::Clocks8,
-            9 => Mstsclhigh::Clocks9,
-            _ => panic!("Invalid value for Mstsclhigh"),
+impl ToClocksEnum<Mstsclhigh> for u8 {
+    type Error = Error;
+    fn to_clocks_enum(self) -> Result<Mstsclhigh> {
+        match self {
+            2 => Ok(Mstsclhigh::Clocks2),
+            3 => Ok(Mstsclhigh::Clocks3),
+            4 => Ok(Mstsclhigh::Clocks4),
+            5 => Ok(Mstsclhigh::Clocks5),
+            6 => Ok(Mstsclhigh::Clocks6),
+            7 => Ok(Mstsclhigh::Clocks7),
+            8 => Ok(Mstsclhigh::Clocks8),
+            9 => Ok(Mstsclhigh::Clocks9),
+            _ => Err(Error::UnsupportedConfiguration),
         }
     }
 }
@@ -100,10 +100,10 @@ struct SpeedRegisterSettings {
 }
 
 impl SpeedRegisterSettings {
-    fn new(duty_cycle: DutyCycle, speed: Speed) -> Result<Self> {
-        const SFRO_CLOCK_SPEED_HZ: u32 = 16_000_000;
+    fn new(duty_cycle: DutyCycle, speed: Speed, strict_mode: bool) -> Result<Self> {
+        const CLOCK_SPEED_HZ: u32 = 48_000_000;
 
-        let target_freq_hz: u32 = match speed {
+        let mut target_freq_hz: u32 = match speed {
             Speed::Standard => 100_000,   // 100 KHz
             Speed::Fast => 400_000,       // 400 KHz
             Speed::FastPlus => 1_000_000, // 1 MHz
@@ -111,24 +111,31 @@ impl SpeedRegisterSettings {
             _ => return Err(Error::UnsupportedConfiguration),
         };
 
+        if strict_mode {
+            target_freq_hz = target_freq_hz * 97 / 100;
+        }
+
         // Figure out what we need to set the clock divider to in order to hit the I2C speed the user requested.  Again, we may not
         // be able to be exact, so we need to find the closest viable option.
         //
         let (result_clocks_hi, result_clocks_lo, result_div_multiplier) = (MIN_CLOCKS..=MAX_CLOCKS)
-            .cartesian_product(MIN_CLOCKS..=MAX_CLOCKS)
+            .rev()
+            .cartesian_product((MIN_CLOCKS..=MAX_CLOCKS).rev())
             .filter(|(hi_clocks, lo_clocks)| get_duty_cycle(*hi_clocks, *lo_clocks) == duty_cycle.value)
             .map(|(hi_clocks, lo_clocks)| {
-                // As speeds increase, clock_div_multiplier will approach 1, so rounding to the nearest whole number (rather than always down
-                // as normal integer division does) can meaningfully reduce error in the actual speed in cases where the remainder is high.
+                // As speeds increase, clock_div_multiplier will approach 1, and this can cause nontrivial overshoot of the target frequency in
+                // cases where the clock_div_multiplier is low. To mitigate this, we round up rather than down when calculating clock_div_multiplier
+                // because undershoot is preferable to overshoot in these cases.
                 let clock_div_multiplier =
-                    rounded_divide(SFRO_CLOCK_SPEED_HZ, target_freq_hz * u32::from(hi_clocks + lo_clocks)) as u16;
+                    CLOCK_SPEED_HZ.div_ceil(target_freq_hz * u32::from(hi_clocks + lo_clocks)) as u16;
                 (hi_clocks, lo_clocks, clock_div_multiplier)
             })
-            .min_by(|a, b| {
-                let (hi_a, lo_a, div_a) = a;
-                let (hi_b, lo_b, div_b) = b;
-                let freq_a = get_freq_hz(*hi_a, *lo_a, *div_a, SFRO_CLOCK_SPEED_HZ);
-                let freq_b = get_freq_hz(*hi_b, *lo_b, *div_b, SFRO_CLOCK_SPEED_HZ);
+            .filter(|(hi_clocks, lo_clocks, clock_div_multiplier)| {
+                get_freq_hz(*hi_clocks, *lo_clocks, *clock_div_multiplier, CLOCK_SPEED_HZ) <= target_freq_hz
+            })
+            .min_by(|(hi_a, lo_a, div_a), (hi_b, lo_b, div_b)| {
+                let freq_a = get_freq_hz(*hi_a, *lo_a, *div_a, CLOCK_SPEED_HZ);
+                let freq_b = get_freq_hz(*hi_b, *lo_b, *div_b, CLOCK_SPEED_HZ);
 
                 target_freq_hz.abs_diff(freq_a).cmp(&target_freq_hz.abs_diff(freq_b))
             })
@@ -138,10 +145,10 @@ impl SpeedRegisterSettings {
         //
         const CLOCK_DIV_MULTIPLIER_OFFSET: u16 = 1;
         Ok(Self {
-            scl_high_clocks: result_clocks_hi.into_clocks_enum(),
-            scl_low_clocks: result_clocks_lo.into_clocks_enum(),
+            scl_high_clocks: result_clocks_hi.to_clocks_enum()?,
+            scl_low_clocks: result_clocks_lo.to_clocks_enum()?,
             clock_div_multiplier: result_div_multiplier - CLOCK_DIV_MULTIPLIER_OFFSET,
-            _actual_freq_hz: SFRO_CLOCK_SPEED_HZ
+            _actual_freq_hz: CLOCK_SPEED_HZ
                 / (u32::from(result_clocks_hi + result_clocks_lo) * u32::from(result_div_multiplier)),
         })
     }
@@ -197,6 +204,9 @@ impl DutyCycle {
 
 impl Default for DutyCycle {
     fn default() -> Self {
+        #[allow(clippy::unwrap_used)]
+        // Panic Safety: this will always succeed, as 40% is within the valid range.
+        //               and if this changes to invalid value, we will know during initial testing.
         DutyCycle::new(40).unwrap()
     }
 }
@@ -209,6 +219,11 @@ pub struct Config {
 
     /// The target duty cycle (percentage of time to hold the SCL line high per bit).
     pub duty_cycle: DutyCycle,
+
+    /// Enable strict mode
+    ///
+    /// If enabled, this flag will reduce the target frequency by 3% when calculating the clock settings to provide some margin, which should prevent jitter from causing the clock speed to exceed the target speed.
+    pub strict_mode: bool,
 }
 
 impl Default for Config {
@@ -216,6 +231,7 @@ impl Default for Config {
         Self {
             speed: Speed::Standard,
             duty_cycle: Default::default(),
+            strict_mode: false,
         }
     }
 }
@@ -230,7 +246,7 @@ impl<'a, M: Mode> I2cMaster<'a, M> {
         dma_ch: Option<dma::channel::Channel<'a>>,
     ) -> Result<Self> {
         // TODO - clock integration
-        let clock = crate::flexcomm::Clock::Sfro;
+        let clock = crate::flexcomm::Clock::Ffro;
         let flexcomm = T::enable(clock);
         T::into_i2c();
 
@@ -240,7 +256,7 @@ impl<'a, M: Mode> I2cMaster<'a, M> {
         let info = T::info();
         let regs = info.regs;
 
-        let speed_settings = SpeedRegisterSettings::new(config.duty_cycle, config.speed)?;
+        let speed_settings = SpeedRegisterSettings::new(config.duty_cycle, config.speed, config.strict_mode)?;
 
         regs.msttime().write(|w| {
             w.mstsclhigh()
@@ -267,11 +283,13 @@ impl<'a, M: Mode> I2cMaster<'a, M> {
     }
 
     fn check_for_bus_errors(&self) -> Result<()> {
-        let i2cregs = self.info.regs;
+        let stat = self.info.regs.stat().read();
 
-        if i2cregs.stat().read().mstarbloss().is_arbitration_loss() {
+        if stat.mststate().is_nack_data() {
+            Err(TransferError::WriteFail.into())
+        } else if stat.mstarbloss().is_arbitration_loss() {
             Err(TransferError::ArbitrationLoss.into())
-        } else if i2cregs.stat().read().mstststperr().is_error() {
+        } else if stat.mstststperr().is_error() {
             Err(TransferError::StartStopError.into())
         } else {
             Ok(())
@@ -289,7 +307,7 @@ impl<'a> I2cMaster<'a, Blocking> {
         config: Config,
     ) -> Result<Self> {
         force_clear_remediation(&T::info());
-        Ok(Self::new_inner::<T>(fc, scl, sda, config, None)?)
+        Self::new_inner::<T>(fc, scl, sda, config, None)
     }
 
     fn start(&mut self, address: u16, is_read: bool) -> Result<()> {
@@ -316,7 +334,7 @@ impl<'a> I2cMaster<'a, Blocking> {
 
         i2cregs.mstdat().write(|w|
             // SAFETY: only unsafe due to .bits usage
-            unsafe { w.data().bits(address << 1 | u8::from(is_read)) });
+            unsafe { w.data().bits((address << 1) | u8::from(is_read)) });
 
         i2cregs.mstctl().write(|w| w.mststart().set_bit());
 
@@ -397,15 +415,13 @@ impl<'a> I2cMaster<'a, Blocking> {
         Ok(())
     }
 
-    fn read_no_stop(&mut self, address: u16, read: &mut [u8]) -> Result<()> {
+    fn read_no_start_no_stop(&mut self, read: &mut [u8]) -> Result<()> {
         let i2cregs = self.info.regs;
 
         // read of 0 size is not allowed according to i2c spec
         if read.is_empty() {
             return Err(TransferError::OtherBusError.into());
         }
-
-        self.start(address, true)?;
 
         let read_len = read.len();
 
@@ -430,11 +446,9 @@ impl<'a> I2cMaster<'a, Blocking> {
         Ok(())
     }
 
-    fn write_no_stop(&mut self, address: u16, write: &[u8]) -> Result<()> {
+    fn write_no_start_no_stop(&mut self, write: &[u8]) -> Result<()> {
         // Procedure from 24.3.1.1 pg 545
         let i2cregs = self.info.regs;
-
-        self.start(address, false)?;
 
         for byte in write {
             i2cregs.mstdat().write(|w|
@@ -514,6 +528,16 @@ impl<'a> I2cMaster<'a, Async> {
     ) -> Result<StartStopGuard> {
         let i2cregs = self.info.regs;
 
+        // Sentinel to perform corrective action if future is dropped
+        let on_drop = OnDrop::new(|| {
+            // Disable and re-enable master mode to clear out stalled HW state
+            // if we failed to complete sending of the address
+            // In practice, this seems to be only way to recover. Engaging with
+            // NXP to see if there is better way to handle this.
+            i2cregs.cfg().write(|w| w.msten().disabled());
+            i2cregs.cfg().write(|w| w.msten().enabled());
+        });
+
         // If there was a previous cancellation, wait for the remediation step by the
         // interrupt to complete.
         wait_remediation_complete(&self.info).await;
@@ -545,19 +569,9 @@ impl<'a> I2cMaster<'a, Async> {
         )
         .await?;
 
-        // Sentinel to perform corrective action if future is dropped
-        let on_drop = OnDrop::new(|| {
-            // Disable and re-enable master mode to clear out stalled HW state
-            // if we failed to complete sending of the address
-            // In practice, this seems to be only way to recover. Engaging with
-            // NXP to see if there is better way to handle this.
-            i2cregs.cfg().write(|w| w.msten().disabled());
-            i2cregs.cfg().write(|w| w.msten().enabled());
-        });
-
         i2cregs.mstdat().write(|w|
             // SAFETY: only unsafe due to .bits usage
-            unsafe { w.data().bits(address << 1 | u8::from(is_read)) });
+            unsafe { w.data().bits((address << 1) | u8::from(is_read)) });
 
         i2cregs.mstctl().write(|w| w.mststart().set_bit());
 
@@ -587,6 +601,16 @@ impl<'a> I2cMaster<'a, Async> {
         }
         let i2cregs = self.info.regs;
 
+        // Sentinel to perform corrective action if future is dropped
+        let on_drop = OnDrop::new(|| {
+            // Disable and re-enable master mode to clear out stalled HW state
+            // if we failed to complete sending of the address
+            // In practice, this seems to be only way to recover. Engaging with
+            // NXP to see if there is better way to handle this.
+            i2cregs.cfg().write(|w| w.msten().disabled());
+            i2cregs.cfg().write(|w| w.msten().enabled());
+        });
+
         // If there was a previous cancellation, wait for the remediation step by the
         // interrupt to complete.
         wait_remediation_complete(&self.info).await;
@@ -617,16 +641,6 @@ impl<'a> I2cMaster<'a, Async> {
             },
         )
         .await?;
-
-        // Sentinel to perform corrective action if future is dropped
-        let on_drop = OnDrop::new(|| {
-            // Disable and re-enable master mode to clear out stalled HW state
-            // if we failed to complete sending of the address
-            // In practice, this seems to be only way to recover. Engaging with
-            // NXP to see if there is better way to handle this.
-            i2cregs.cfg().write(|w| w.msten().disabled());
-            i2cregs.cfg().write(|w| w.msten().enabled());
-        });
 
         // The first byte of a 10-bit address is 11110XXX,
         // where XXX are the 2 most significant bits of the 10-bit address
@@ -660,12 +674,7 @@ impl<'a> I2cMaster<'a, Async> {
         Ok(guard)
     }
 
-    async fn read_no_stop(
-        &mut self,
-        address: u16,
-        read: &mut [u8],
-        guard: Option<StartStopGuard>,
-    ) -> Result<StartStopGuard> {
+    async fn read_no_start_no_stop(&mut self, read: &mut [u8]) -> Result<()> {
         let i2cregs = self.info.regs;
 
         // read of 0 size is not allowed according to i2c spec
@@ -676,12 +685,10 @@ impl<'a> I2cMaster<'a, Async> {
             return Err(TransferError::OtherBusError.into());
         };
 
-        let guard = self.start(address, true, guard).await?;
-
-        if self.dma_ch.is_some() {
+        if let Some(dma_ch) = &self.dma_ch {
             if !dma_read.is_empty() {
                 let transfer = dma::transfer::Transfer::new_read(
-                    self.dma_ch.as_mut().unwrap(),
+                    dma_ch,
                     i2cregs.mstdat().as_ptr() as *mut u8,
                     dma_read,
                     Default::default(),
@@ -704,7 +711,7 @@ impl<'a> I2cMaster<'a, Async> {
                 let res = select(
                     transfer,
                     poll_fn(|cx| {
-                        I2C_WAKERS[self.info.index].register(cx.waker());
+                        self.info.waker.register(cx.waker());
 
                         i2cregs.intenset().write(|w| {
                             w.mstpendingen()
@@ -809,27 +816,20 @@ impl<'a> I2cMaster<'a, Async> {
                 }
             }
         }
-        Ok(guard)
+        Ok(())
     }
 
-    async fn write_no_stop(
-        &mut self,
-        address: u16,
-        write: &[u8],
-        guard: Option<StartStopGuard>,
-    ) -> Result<StartStopGuard> {
+    async fn write_no_start_no_stop(&mut self, write: &[u8]) -> Result<()> {
         // Procedure from 24.3.1.1 pg 545
         let i2cregs = self.info.regs;
 
-        let guard = self.start(address, false, guard).await?;
-
         if write.is_empty() {
-            return Ok(guard);
+            return Ok(());
         }
 
-        if self.dma_ch.is_some() {
+        if let Some(dma_ch) = &self.dma_ch {
             let transfer = dma::transfer::Transfer::new_write(
-                self.dma_ch.as_mut().unwrap(),
+                dma_ch,
                 write,
                 i2cregs.mstdat().as_ptr() as *mut u8,
                 Default::default(),
@@ -852,7 +852,7 @@ impl<'a> I2cMaster<'a, Async> {
             let res = select(
                 transfer,
                 poll_fn(|cx| {
-                    I2C_WAKERS[self.info.index].register(cx.waker());
+                    self.info.waker.register(cx.waker());
 
                     i2cregs.intenset().write(|w| {
                         w.mstpendingen()
@@ -865,7 +865,9 @@ impl<'a> I2cMaster<'a, Async> {
 
                     let stat = i2cregs.stat().read();
 
-                    if stat.mstarbloss().is_arbitration_loss() {
+                    if stat.mststate().is_nack_data() {
+                        Poll::Ready(Err::<(), Error>(TransferError::WriteFail.into()))
+                    } else if stat.mstarbloss().is_arbitration_loss() {
                         Poll::Ready(Err::<(), Error>(TransferError::ArbitrationLoss.into()))
                     } else if stat.mstststperr().is_error() {
                         Poll::Ready(Err::<(), Error>(TransferError::StartStopError.into()))
@@ -888,7 +890,11 @@ impl<'a> I2cMaster<'a, Async> {
                     let stat = me.info.regs.stat().read();
 
                     if stat.mstpending().is_pending() {
-                        Poll::Ready(Ok::<(), Error>(()))
+                        if stat.mststate().is_nack_data() {
+                            Poll::Ready(Err::<(), Error>(TransferError::WriteFail.into()))
+                        } else {
+                            Poll::Ready(Ok::<(), Error>(()))
+                        }
                     } else if stat.mstarbloss().is_arbitration_loss() {
                         Poll::Ready(Err(TransferError::ArbitrationLoss.into()))
                     } else if stat.mstststperr().is_error() {
@@ -909,7 +915,7 @@ impl<'a> I2cMaster<'a, Async> {
                 },
             )
             .await?;
-            Ok(guard)
+            Ok(())
         } else {
             for byte in write.iter() {
                 i2cregs.mstdat().write(|w|
@@ -923,7 +929,11 @@ impl<'a> I2cMaster<'a, Async> {
                         let stat = me.info.regs.stat().read();
 
                         if stat.mstpending().is_pending() {
-                            Poll::Ready(Ok::<(), Error>(()))
+                            if stat.mststate().is_nack_data() {
+                                Poll::Ready(Err::<(), Error>(TransferError::WriteFail.into()))
+                            } else {
+                                Poll::Ready(Ok::<(), Error>(()))
+                            }
                         } else if stat.mstarbloss().is_arbitration_loss() {
                             Poll::Ready(Err(TransferError::ArbitrationLoss.into()))
                         } else if stat.mstststperr().is_error() {
@@ -947,11 +957,11 @@ impl<'a> I2cMaster<'a, Async> {
 
                 self.check_for_bus_errors()?;
             }
-            Ok(guard)
+            Ok(())
         }
     }
 
-    async fn stop(&mut self) -> Result<()> {
+    fn stop(&mut self) -> Result<impl Future<Output = Result<()>> + use<'a, '_>> {
         // Procedure from 24.3.1.1 pg 545
         let i2cregs = self.info.regs;
 
@@ -961,7 +971,7 @@ impl<'a> I2cMaster<'a, Async> {
 
         i2cregs.mstctl().write(|w| w.mststop().set_bit());
 
-        self.wait_on(
+        Ok(self.wait_on(
             |me| {
                 let stat = me.info.regs.stat().read();
 
@@ -985,21 +995,20 @@ impl<'a> I2cMaster<'a, Async> {
                         .set_bit()
                 });
             },
-        )
-        .await
+        ))
     }
 
     /// Calls `f` to check if we are ready or not.
     /// If not, `g` is called once the waker is set (to eg enable the required interrupts).
-    async fn wait_on<F, U, G>(&mut self, mut f: F, mut g: G) -> U
+    fn wait_on<F, U, G>(&mut self, mut f: F, mut g: G) -> impl Future<Output = U> + use<'_, 'a, F, U, G>
     where
         F: FnMut(&mut Self) -> Poll<U>,
         G: FnMut(&mut Self),
     {
-        poll_fn(|cx| {
+        poll_fn(move |cx| {
             // Register waker before checking condition, to ensure that wakes/interrupts
             // aren't lost between f() and g()
-            I2C_WAKERS[self.info.index].register(cx.waker());
+            self.info.waker.register(cx.waker());
             let r = f(self);
 
             if r.is_pending() {
@@ -1008,13 +1017,12 @@ impl<'a> I2cMaster<'a, Async> {
 
             r
         })
-        .await
     }
 
     /// During i2c start, poll for ready state and check for errors
-    async fn poll_for_ready(&mut self, is_read: bool) -> Result<()> {
+    fn poll_for_ready(&mut self, is_read: bool) -> impl Future<Output = Result<()>> + use<'a, '_> {
         self.wait_on(
-            |me| {
+            move |me| {
                 let stat = me.info.regs.stat().read();
 
                 if stat.mstpending().is_pending() {
@@ -1049,7 +1057,6 @@ impl<'a> I2cMaster<'a, Async> {
                 });
             },
         )
-        .await
     }
 }
 
@@ -1080,87 +1087,91 @@ impl<M: Mode> embedded_hal_1::i2c::ErrorType for I2cMaster<'_, M> {
 
 // implement generic i2c interface for peripheral master type
 impl<A: embedded_hal_1::i2c::AddressMode + Into<u16>> embedded_hal_1::i2c::I2c<A> for I2cMaster<'_, Blocking> {
-    fn read(&mut self, address: A, read: &mut [u8]) -> Result<()> {
-        self.read_no_stop(address.into(), read)?;
-        self.stop()
-    }
-
-    fn write(&mut self, address: A, write: &[u8]) -> Result<()> {
-        self.write_no_stop(address.into(), write)?;
-        self.stop()
-    }
-
-    fn write_read(&mut self, address: A, write: &[u8], read: &mut [u8]) -> Result<()> {
-        let address = address.into();
-        self.write_no_stop(address, write)?;
-        self.read_no_stop(address, read)?;
-        self.stop()
-    }
-
     fn transaction(&mut self, address: A, operations: &mut [embedded_hal_1::i2c::Operation<'_>]) -> Result<()> {
-        let needs_stop = !operations.is_empty();
-        let address = address.into();
+        let Some(first_operation) = operations.first() else {
+            return Ok(());
+        };
 
+        // Send beginning start
+        let address = address.into();
+        self.start(
+            address,
+            match first_operation {
+                embedded_hal_1::i2c::Operation::Read(_) => true,
+                embedded_hal_1::i2c::Operation::Write(_) => false,
+            },
+        )?;
+
+        let mut last_seen_op: Option<&mut embedded_hal_1::i2c::Operation<'_>> = None;
         for op in operations {
             match op {
                 embedded_hal_1::i2c::Operation::Read(read) => {
-                    self.read_no_stop(address, read)?;
+                    if matches!(last_seen_op.as_ref(), Some(embedded_hal_1::i2c::Operation::Write(_))) {
+                        // We just sent a Write and now we have a Read, send restart.
+                        self.start(address, true)?;
+                    }
+                    self.read_no_start_no_stop(read)?;
                 }
                 embedded_hal_1::i2c::Operation::Write(write) => {
-                    self.write_no_stop(address, write)?;
+                    if matches!(last_seen_op.as_ref(), Some(embedded_hal_1::i2c::Operation::Read(_))) {
+                        // We just sent a Read and now we have a Write, send restart.
+                        self.start(address, false)?;
+                    }
+                    self.write_no_start_no_stop(write)?;
                 }
             }
+            last_seen_op = Some(op);
         }
 
-        if needs_stop {
-            self.stop()?;
-        }
+        self.stop()?;
 
         Ok(())
     }
 }
 
 impl<A: embedded_hal_1::i2c::AddressMode + Into<u16>> embedded_hal_async::i2c::I2c<A> for I2cMaster<'_, Async> {
-    async fn read(&mut self, address: A, read: &mut [u8]) -> Result<()> {
-        let guard = self.read_no_stop(address.into(), read, None).await?;
-        self.stop().await?;
-        guard.defuse();
-        Ok(())
-    }
-
-    async fn write(&mut self, address: A, write: &[u8]) -> Result<()> {
-        let guard = self.write_no_stop(address.into(), write, None).await?;
-        self.stop().await?;
-        guard.defuse();
-        Ok(())
-    }
-
-    async fn write_read(&mut self, address: A, write: &[u8], read: &mut [u8]) -> Result<()> {
-        let address = address.into();
-        let guard = self.write_no_stop(address, write, None).await?;
-        let guard = self.read_no_stop(address, read, Some(guard)).await?;
-        self.stop().await?;
-        guard.defuse();
-        Ok(())
-    }
-
     async fn transaction(&mut self, address: A, operations: &mut [embedded_hal_1::i2c::Operation<'_>]) -> Result<()> {
-        let address = address.into();
-        let mut guard = None;
+        let Some(first_operation) = operations.first() else {
+            return Ok(());
+        };
 
+        // Send beginning start
+        let address = address.into();
+        let mut guard = Some(
+            self.start(
+                address,
+                match first_operation {
+                    embedded_hal_1::i2c::Operation::Read(_) => true,
+                    embedded_hal_1::i2c::Operation::Write(_) => false,
+                },
+                None,
+            )
+            .await?,
+        );
+
+        let mut last_seen_op: Option<&mut embedded_hal_1::i2c::Operation<'_>> = None;
         for op in operations {
             match op {
                 embedded_hal_1::i2c::Operation::Read(read) => {
-                    guard = Some(self.read_no_stop(address, read, guard).await?);
+                    if matches!(last_seen_op.as_ref(), Some(embedded_hal_1::i2c::Operation::Write(_))) {
+                        // We just sent a Write and now we have a Read, send restart.
+                        guard = Some(self.start(address, true, guard).await?);
+                    }
+                    self.read_no_start_no_stop(read).await?;
                 }
                 embedded_hal_1::i2c::Operation::Write(write) => {
-                    guard = Some(self.write_no_stop(address, write, guard).await?);
+                    if matches!(last_seen_op.as_ref(), Some(embedded_hal_1::i2c::Operation::Read(_))) {
+                        // We just sent a Read and now we have a Write, send restart.
+                        guard = Some(self.start(address, false, guard).await?);
+                    }
+                    self.write_no_start_no_stop(write).await?;
                 }
             }
+            last_seen_op = Some(op);
         }
 
         if let Some(guard) = guard {
-            self.stop().await?;
+            self.stop()?.await?;
             guard.defuse();
         }
 
@@ -1207,7 +1218,7 @@ impl Drop for StartStopGuard {
             } else {
                 // We are NOT pending, we need to ask the interrupt to send a stop the next
                 // time the engine is pending. We ensured that the interrupt is active above
-                I2C_REMEDIATION[self.info.index].fetch_or(REMEDIATON_MASTER_STOP, Ordering::AcqRel);
+                self.info.remediation.fetch_or(REMEDIATON_MASTER_STOP, Ordering::AcqRel);
             }
         })
     }

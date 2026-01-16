@@ -23,19 +23,27 @@ pub mod crc;
 pub mod dma;
 
 #[cfg(feature = "_espi")]
+#[allow(clippy::indexing_slicing)]
 pub mod espi;
 
 pub mod flash;
 pub mod flexcomm;
-pub mod flexspi_nor_storage_bus;
+/// Flexspi driver
+pub mod flexspi;
 pub mod gpio;
 pub mod hashcrypt;
 pub mod i2c;
 pub mod iopctl;
 pub mod pwm;
 pub mod rng;
+pub mod spi;
+pub mod uuid;
+
+#[cfg(not(feature = "time-driver-rtc"))]
+pub mod rtc;
+
 /// Time driver for the iMX RT600 series.
-#[cfg(feature = "time-driver")]
+#[cfg(feature = "_time-driver")]
 pub mod time_driver;
 /// NXP Timer Driver for handling timer-related functionalities.
 /// Module provides functionality for
@@ -57,11 +65,32 @@ pub use chip::interrupts::*;
 pub use chip::pac;
 #[cfg(not(feature = "unstable-pac"))]
 pub(crate) use chip::pac;
-pub use chip::{peripherals, Peripherals};
+pub use chip::{Peripherals, peripherals};
 pub use embassy_hal_internal::{Peri, PeripheralType};
 
 #[cfg(feature = "rt")]
 pub use crate::pac::NVIC_PRIO_BITS;
+
+// Helper function for interrupt handling with optional tracing
+#[inline(always)]
+#[doc(hidden)]
+pub unsafe fn __handle_interrupt<T, H>()
+where
+    T: crate::interrupt::typelevel::Interrupt,
+    H: crate::interrupt::typelevel::Handler<T>,
+{
+    #[cfg(feature = "systemview-tracing")]
+    {
+        systemview_tracing::trace_interrupt! {
+            H::on_interrupt();
+        }
+    }
+
+    #[cfg(not(feature = "systemview-tracing"))]
+    {
+        unsafe { H::on_interrupt() };
+    }
+}
 
 /// Macro to bind interrupts to handlers.
 ///
@@ -88,10 +117,10 @@ macro_rules! bind_interrupts {
 
         $(
             #[allow(non_snake_case)]
-            #[no_mangle]
+            #[unsafe(no_mangle)]
             unsafe extern "C" fn $irq() {
                 $(
-                    <$handler as $crate::interrupt::typelevel::Handler<$crate::interrupt::typelevel::$irq>>::on_interrupt();
+                    $crate::__handle_interrupt::<$crate::interrupt::typelevel::$irq, $handler>();
                 )*
             }
 
@@ -112,7 +141,7 @@ pub mod config {
         /// Clock configuration.
         pub clocks: ClockConfig,
         /// Time driver interrupt priority. Should be lower priority than softdevice if used.
-        #[cfg(feature = "time-driver")]
+        #[cfg(feature = "_time-driver")]
         pub time_interrupt_priority: crate::interrupt::Priority,
     }
 
@@ -120,7 +149,7 @@ pub mod config {
         fn default() -> Self {
             Self {
                 clocks: ClockConfig::crystal(),
-                #[cfg(feature = "time-driver")]
+                #[cfg(feature = "_time-driver")]
                 time_interrupt_priority: crate::interrupt::Priority::P0,
             }
         }
@@ -131,7 +160,7 @@ pub mod config {
         pub fn new(clocks: ClockConfig) -> Self {
             Self {
                 clocks,
-                #[cfg(feature = "time-driver")]
+                #[cfg(feature = "_time-driver")]
                 time_interrupt_priority: crate::interrupt::Priority::P0,
             }
         }
@@ -153,9 +182,9 @@ pub fn init(config: config::Config) -> Peripherals {
             error!("unable to initialize Clocks for reason: {:?}", e);
             // Panic here?
         }
-        flash::init();
-        #[cfg(feature = "time-driver")]
+        #[cfg(feature = "_time-driver")]
         time_driver::init(config.time_interrupt_priority);
+        flash::init();
         dma::init();
         gpio::init();
         timer::init();

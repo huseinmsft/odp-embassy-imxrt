@@ -2,7 +2,7 @@
 //!
 //! Also known as IO Pin Configuration (IOCON)
 
-use crate::pac::{iopctl, Iopctl};
+use crate::pac::{Iopctl, iopctl};
 
 // A generic pin of any type.
 //
@@ -190,6 +190,12 @@ pub struct AnyPin {
     reg: &'static PioM_N,
 }
 
+// allow placing pins in guarded Mutexes
+// SAFETY: safety for Send here is the same as the other accessors to unsafe blocks: it must be done from a single executor context.
+//         This is a temporary workaround -- a better solution might be to refactor AnyPin to no longer maintain a reference to PioM_N,
+//         but instead look up the correct register set and then perform operations within an unsafe block as we do for other peripherals
+unsafe impl Send for AnyPin {}
+
 impl AnyPin {
     /// Creates a pin from raw port and pin numbers which can then be configured.
     ///
@@ -260,9 +266,9 @@ impl FC15Pin {
         let iopctl = unsafe { crate::pac::Iopctl::steal() };
 
         let reg = if pin == 0 {
-            &*iopctl.fc15_i2c_scl().as_ptr().cast()
+            unsafe { &*iopctl.fc15_i2c_scl().as_ptr().cast() }
         } else {
-            &*iopctl.fc15_i2c_sda().as_ptr().cast()
+            unsafe { &*iopctl.fc15_i2c_sda().as_ptr().cast() }
         };
 
         Self { reg }

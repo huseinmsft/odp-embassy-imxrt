@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 
 use embassy_hal_internal::{Peri, PeripheralType};
 
-use crate::clocks::{enable_and_reset, SysconPeripheral};
+use crate::clocks::{SysconPeripheral, enable_and_reset};
 use crate::peripherals::{WDT0, WDT1};
 
 /// Windowed watchdog timer (WWDT) driver.
@@ -16,6 +16,11 @@ pub struct WindowedWatchdog<'d> {
 struct Info {
     regs: &'static crate::pac::wwdt0::RegisterBlock,
 }
+
+// SAFETY: safety for Send here is the same as the other accessors to unsafe blocks: it must be done from a single executor context.
+//         This is a temporary workaround -- a better solution might be to refactor Info to no longer maintain a reference to regs,
+//         but instead look up the correct register set and then perform operations within an unsafe block as we do for other peripherals
+unsafe impl Send for Info {}
 
 trait SealedInstance {
     /// Returns a new Info, containing a reference to the register block.
@@ -192,6 +197,9 @@ impl<'d> WindowedWatchdog<'d> {
     /// must be performed before this call.
     pub fn unleash(&mut self) {
         self.info.regs.mod_().modify(|_, w| w.wden().set_bit());
+
+        // A feed must be performed after setting WDEN bit to actually enable watchdog
+        self.feed();
     }
 
     /// Reloads the watchdog timeout counter to the time set by [`Self::set_timeout`].

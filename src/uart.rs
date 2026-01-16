@@ -1,10 +1,10 @@
 //! Universal Asynchronous Receiver Transmitter (UART) driver.
 
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
 use core::task::Poll;
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{Peri, PeripheralType};
 use embassy_sync::waitqueue::AtomicWaker;
@@ -315,7 +315,11 @@ impl<'a, M: Mode> Uart<'a, M> {
         }
 
         if rx.is_some() {
-            regs.fifocfg().modify(|_, w| w.emptyrx().set_bit().enablerx().enabled());
+            regs.fifocfg()
+                .modify(|_, w| w.emptyrx().set_bit().enablerx().enabled().wakerx().enabled());
+
+            regs.fifotrig()
+                .modify(|_, w| unsafe { w.rxlvl().bits(0) }.rxlvlena().set_bit());
 
             // clear FIFO error
             regs.fifostat().write(|w| w.rxerr().set_bit());
@@ -564,7 +568,8 @@ impl<'a> UartTx<'a, Async> {
             regs.fifocfg().modify(|_, w| w.dmatx().enabled());
 
             let transfer = Transfer::new_write(
-                self._tx_dma.as_ref().unwrap(),
+                // an async UART instance cannot be created without a dma channel
+                self._tx_dma.as_ref().ok_or(Error::Fail)?,
                 chunk,
                 regs.fifowr().as_ptr() as *mut u8,
                 Default::default(),
@@ -573,7 +578,7 @@ impl<'a> UartTx<'a, Async> {
             let res = select(
                 transfer,
                 poll_fn(|cx| {
-                    UART_WAKERS[self.info.index].register(cx.waker());
+                    self.info.waker.register(cx.waker());
 
                     self.info.regs.intenset().write(|w| {
                         w.framerren()
@@ -624,7 +629,7 @@ impl<'a> UartTx<'a, Async> {
     }
 
     /// Flush UART TX asynchronously.
-    pub async fn flush(&mut self) -> Result<()> {
+    pub fn flush(&mut self) -> impl Future<Output = Result<()>> + use<'_, 'a> {
         self.wait_on(
             |me| {
                 if me.info.regs.stat().read().txidle().bit_is_set() {
@@ -637,20 +642,19 @@ impl<'a> UartTx<'a, Async> {
                 me.info.regs.intenset().write(|w| w.txidleen().set_bit());
             },
         )
-        .await
     }
 
     /// Calls `f` to check if we are ready or not.
     /// If not, `g` is called once the waker is set (to eg enable the required interrupts).
-    async fn wait_on<F, U, G>(&mut self, mut f: F, mut g: G) -> U
+    fn wait_on<F, U, G>(&mut self, mut f: F, mut g: G) -> impl Future<Output = U> + use<'_, 'a, F, U, G>
     where
         F: FnMut(&mut Self) -> Poll<U>,
         G: FnMut(&mut Self),
     {
-        poll_fn(|cx| {
+        poll_fn(move |cx| {
             // Register waker before checking condition, to ensure that wakes/interrupts
             // aren't lost between f() and g()
-            UART_WAKERS[self.info.index].register(cx.waker());
+            self.info.waker.register(cx.waker());
             let r = f(self);
 
             if r.is_pending() {
@@ -659,7 +663,6 @@ impl<'a> UartTx<'a, Async> {
 
             r
         })
-        .await
     }
 }
 
@@ -692,7 +695,7 @@ impl<'a> UartRx<'a, Async> {
             regs.fifocfg().modify(|_, w| w.dmarx().enabled());
 
             let transfer = Transfer::new_read(
-                self._rx_dma.as_ref().unwrap(),
+                self._rx_dma.as_ref().ok_or(Error::Fail)?,
                 regs.fiford().as_ptr() as *mut u8,
                 chunk,
                 Default::default(),
@@ -706,7 +709,7 @@ impl<'a> UartRx<'a, Async> {
             let res = select(
                 transfer,
                 poll_fn(|cx| {
-                    UART_WAKERS[self.info.index].register(cx.waker());
+                    self.info.waker.register(cx.waker());
 
                     self.info.regs.intenset().write(|w| {
                         w.framerren()
@@ -830,18 +833,18 @@ impl<'a> Uart<'a, Async> {
     }
 
     /// Read from UART RX.
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.rx.read(buf).await
+    pub fn read<'buf>(&mut self, buf: &'buf mut [u8]) -> impl Future<Output = Result<()>> + use<'_, 'a, 'buf> {
+        self.rx.read(buf)
     }
 
     /// Transmit the provided buffer.
-    pub async fn write(&mut self, buf: &[u8]) -> Result<()> {
-        self.tx.write(buf).await
+    pub fn write<'buf>(&mut self, buf: &'buf [u8]) -> impl Future<Output = Result<()>> + use<'_, 'a, 'buf> {
+        self.tx.write(buf)
     }
 
     /// Flush UART TX.
-    pub async fn flush(&mut self) -> Result<()> {
-        self.tx.flush().await
+    pub fn flush(&mut self) -> impl Future<Output = Result<()>> + use<'_, 'a> {
+        self.tx.flush()
     }
 }
 
@@ -1089,12 +1092,17 @@ impl embedded_io_async::Write for Uart<'_, Async> {
 
 struct Info {
     regs: &'static crate::pac::usart0::RegisterBlock,
-    index: usize,
+    waker: &'static AtomicWaker,
 }
+
+// SAFETY: safety for Send here is the same as the other accessors to unsafe blocks: it must be done from a single executor context.
+//         This is a temporary workaround -- a better solution might be to refactor Info to no longer maintain a reference to regs,
+//         but instead look up the correct register set and then perform operations within an unsafe block as we do for other peripherals
+unsafe impl Send for Info {}
 
 trait SealedInstance {
     fn info() -> Info;
-    fn index() -> usize;
+    fn waker() -> &'static AtomicWaker;
 }
 
 /// UART interrupt handler.
@@ -1102,12 +1110,8 @@ pub struct InterruptHandler<T: Instance> {
     _phantom: PhantomData<T>,
 }
 
-const UART_COUNT: usize = 8;
-static UART_WAKERS: [AtomicWaker; UART_COUNT] = [const { AtomicWaker::new() }; UART_COUNT];
-
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
-        let waker = &UART_WAKERS[T::index()];
         let regs = T::info().regs;
         let stat = regs.intstat().read();
 
@@ -1131,7 +1135,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             });
         }
 
-        waker.wake();
+        T::waker().wake();
     }
 }
 
@@ -1150,13 +1154,13 @@ macro_rules! impl_instance {
                     fn info() -> Info {
                         Info {
                             regs: unsafe { &*crate::pac::[<Usart $n>]::ptr() },
-                            index: $n,
+                            waker: Self::waker(),
                         }
                     }
 
-                    #[inline]
-                    fn index() -> usize {
-                        $n
+                    fn waker() -> &'static AtomicWaker {
+                        static WAKER: AtomicWaker = AtomicWaker::new();
+                        &WAKER
                     }
                 }
 

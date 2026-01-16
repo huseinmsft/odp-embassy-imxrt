@@ -1,5 +1,5 @@
 //! Clock configuration for the `RT6xx`
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 #[cfg(feature = "defmt")]
 use defmt;
@@ -95,9 +95,8 @@ impl ClockConfig {
             hclk: HclkConfig { state: State::Disabled },
             main_clk: MainClkConfig {
                 state: State::Enabled,
-                //FFRO divided by 4 is reset values of Main Clk Sel A, Sel B
-                src: MainClkSrc::FFRO,
-                div_int: AtomicU32::new(4),
+                src: MainClkSrc::PllMain,
+                div_int: AtomicU32::new(2),
                 freq: AtomicU32::new(CORE_CPU_FREQ),
             },
             main_pll_clk: MainPllClkConfig {
@@ -503,7 +502,6 @@ impl ConfigurableClock for LposcConfig {
                 }
             }
         } else {
-            error!("failed to convert desired clock rate, {:#}, to LPOSC Freq", freq);
             Err(ClockError::InvalidFrequency)
         }
     }
@@ -549,7 +547,6 @@ impl ConfigurableClock for FfroConfig {
         Ok(())
     }
     fn get_clock_rate(&self) -> Result<u32, ClockError> {
-        trace!("getting ffro clock rate");
         Ok(self.freq.load(Ordering::Relaxed))
     }
     fn set_clock_rate(&mut self, _div: u8, _mult: u8, freq: u32) -> Result<(), ClockError> {
@@ -579,7 +576,6 @@ impl ConfigurableClock for FfroConfig {
                 }
             }
         } else {
-            error!("failed to convert desired clock rate, {:#}, to FFRO Freq", freq);
             Err(ClockError::InvalidFrequency)
         }
     }
@@ -616,7 +612,6 @@ impl ConfigurableClock for SfroConfig {
     fn set_clock_rate(&mut self, _div: u8, _mult: u8, freq: u32) -> Result<(), ClockError> {
         if self.state == State::Enabled {
             if freq == SFRO_FREQ {
-                trace!("Sfro frequency is already set at 16MHz");
                 Ok(())
             } else {
                 Err(ClockError::InvalidFrequency)
@@ -677,7 +672,6 @@ impl MultiSourceClock for MainPllClkConfig {
                 }
                 MainPllClkSrc::SFRO => {
                     if !clock_src_config.is_enabled() {
-                        error!("Can't set SFRO as source for MainPll as it's not enabled");
                         return Err(ClockError::ClockNotEnabled);
                     }
                     // check if desired frequency is a valid multiple of 16m SFRO clock
@@ -703,7 +697,6 @@ impl ConfigurableClock for MainPllClkConfig {
     }
     fn disable(&self) -> Result<(), ClockError> {
         if self.is_enabled() {
-            error!("Attempting to reset the Main Pll Clock, should be resetting its source");
             Err(ClockError::ClockNotSupported)
         } else {
             Err(ClockError::ClockNotEnabled)
@@ -719,7 +712,6 @@ impl ConfigurableClock for MainPllClkConfig {
     }
     fn set_clock_rate(&mut self, div: u8, mult: u8, freq: u32) -> Result<(), ClockError> {
         if self.is_enabled() {
-            trace!("attempting to set main pll clock rate");
             // SAFETY: unsafe needed to take pointers to Sysctl0 and Clkctl0
             let clkctl0 = unsafe { crate::pac::Clkctl0::steal() };
             let sysctl0 = unsafe { crate::pac::Sysctl0::steal() };
@@ -741,15 +733,12 @@ impl ConfigurableClock for MainPllClkConfig {
                             base_rate = r;
                         }
                         MainPllClkSrc::FFRO => {
-                            trace!("found FFRO as source, wait a bit");
                             delay_loop_clocks(1000, desired_freq);
                             match clkctl0.ffroctl0().read().trim_range().is_ffro_48mhz() {
                                 true => base_rate = Into::into(FfroFreq::Ffro48m),
                                 false => base_rate = Into::into(FfroFreq::Ffro60m),
                             }
-                            trace!("found ffro rate to be: {:#}", base_rate);
                             if div == 2 {
-                                trace!("dividing FFRO rate by 2");
                                 clkctl0.syspll0clksel().write(|w| w.sel().ffro_div_2());
                                 delay_loop_clocks(150, desired_freq);
                                 base_rate /= 2;
@@ -763,10 +752,8 @@ impl ConfigurableClock for MainPllClkConfig {
                         }
                     };
                     base_rate *= u32::from(mult);
-                    trace!("calculated base rate at: {:#}", base_rate);
                     if base_rate != freq {
                         // make sure to power syspll back up before returning the error
-                        error!("invalid frequency found, powering syspll back up before returning error. Check div and mult");
                         // Clear System PLL reset
                         clkctl0.syspll0ctl0().write(|w| w.reset().normal());
                         // Power up SYSPLL
@@ -775,13 +762,11 @@ impl ConfigurableClock for MainPllClkConfig {
                             .write(|w| w.syspllana_pd().clr_pdruncfg0().syspllldo_pd().clr_pdruncfg0());
                         return Err(ClockError::InvalidFrequency);
                     }
-                    trace!("setting default num and denom");
                     // SAFETY: unsafe needed to write the bits for the num and demon fields
                     clkctl0.syspll0num().write(|w| unsafe { w.num().bits(0b0) });
                     clkctl0.syspll0denom().write(|w| unsafe { w.denom().bits(0b1) });
                     delay_loop_clocks(30, desired_freq);
                     self.mult.store(mult, Ordering::Relaxed);
-                    trace!("setting self.mult as: {:#}", mult);
                     match mult {
                         16 => {
                             clkctl0.syspll0ctl0().modify(|_r, w| w.mult().div_16());
@@ -803,7 +788,6 @@ impl ConfigurableClock for MainPllClkConfig {
                         }
                         _ => return Err(ClockError::InvalidMult),
                     }
-                    trace!("clear syspll reset");
                     // Clear System PLL reset
                     clkctl0.syspll0ctl0().modify(|_r, w| w.reset().normal());
                     // Power up SYSPLL
@@ -819,7 +803,6 @@ impl ConfigurableClock for MainPllClkConfig {
                     clkctl0.syspll0ctl0().modify(|_, w| w.holdringoff_ena().dsiable());
                     delay_loop_clocks(15, desired_freq);
 
-                    trace!("setting new PFD0 bits");
                     // gate the output and clear bits.
                     // SAFETY: unsafe needed to write the bits for pfd0
                     clkctl0
@@ -833,7 +816,6 @@ impl ConfigurableClock for MainPllClkConfig {
                         .modify(|_r, w| unsafe { w.pfd0().bits(0x12) }.pfd0_clkgate().not_gated());
                     // wait for ready bit to be set
                     delay_loop_clocks(50, desired_freq);
-                    trace!("waiting for mainpll clock to be ready");
                     while clkctl0.syspll0pfd().read().pfd0_clkrdy().bit_is_clear() {}
                     // clear by writing a 1
                     clkctl0.syspll0pfd().modify(|_, w| w.pfd0_clkrdy().set_bit());
@@ -854,13 +836,10 @@ impl ConfigurableClock for MainPllClkConfig {
 impl MainPllClkConfig {
     /// Calculate the mult value of a desired frequency, return error if invalid
     pub(self) fn calc_mult(rate: u32, base_freq: u32) -> Result<u8, ClockError> {
-        trace!("calculating mult for {:#} / {:#}", rate, base_freq);
         const VALIDMULTS: [u8; 6] = [16, 17, 20, 22, 27, 33];
 
-        if rate > base_freq && rate % base_freq == 0 {
+        if rate > base_freq && rate.is_multiple_of(base_freq) {
             let mult = (rate / base_freq) as u8;
-
-            trace!("verifying that calculated mult {:#} is valid", mult);
 
             if VALIDMULTS.contains(&mult) {
                 Ok(mult)
@@ -957,13 +936,39 @@ impl MainPllClkConfig {
 }
 
 impl MainClkConfig {
-    fn init_main_clk() {
+    /// Configure the FFRO/4 as the main clock source.
+    ///
+    /// This is the same as the reset value.
+    fn reset_main_clk() {
+        let clkctl0 = unsafe { crate::pac::Clkctl0::steal() };
+        clkctl0.mainclksela().write(|w| w.sel().ffro_div_4());
+        clkctl0.mainclkselb().write(|w| w.sel().main_1st_clk());
+    }
+
+    fn init_main_clk(&self) {
         // SAFETY:: unsafe needed to take pointers to Clkctl0 and Clkctl1
         // used to set the right HW frequency
         let clkctl0 = unsafe { crate::pac::Clkctl0::steal() };
         let clkctl1 = unsafe { crate::pac::Clkctl1::steal() };
 
-        clkctl0.mainclkselb().write(|w| w.sel().main_pll_clk());
+        let (clk_a, clk_b) = {
+            use pac::clkctl0::mainclksela::Sel as SelA;
+            use pac::clkctl0::mainclkselb::Sel as SelB;
+            match self.src {
+                MainClkSrc::FFROdiv4 => (Some(SelA::FfroDiv4), SelB::Main1stClk),
+                MainClkSrc::ClkIn => (Some(SelA::SysxtalClk), SelB::Main1stClk),
+                MainClkSrc::Lposc => (Some(SelA::Lposc), SelB::Main1stClk),
+                MainClkSrc::FFRO => (Some(SelA::FfroClk), SelB::Main1stClk),
+                MainClkSrc::SFRO => (None, SelB::SfroClk),
+                MainClkSrc::PllMain => (None, SelB::MainPllClk),
+                MainClkSrc::RTC32k => (None, SelB::Rtc32kClk),
+            }
+        };
+
+        if let Some(clk_a) = clk_a {
+            clkctl0.mainclksela().write(|w| w.sel().variant(clk_a));
+        }
+        clkctl0.mainclkselb().write(|w| w.sel().variant(clk_b));
 
         // Set PFC0DIV divider to value 2, Subtract 1 since 0-> 1, 1-> 2, etc...
         clkctl0.pfcdiv(0).modify(|_, w| w.reset().set_bit());
@@ -1107,11 +1112,10 @@ impl MultiSourceClock for MainClkConfig {
 
 impl ConfigurableClock for MainClkConfig {
     fn enable_and_reset(&self) -> Result<(), ClockError> {
-        MainClkConfig::init_main_clk();
+        self.init_main_clk();
         Ok(())
     }
     fn disable(&self) -> Result<(), ClockError> {
-        error!("Attempting to reset the main clock, should NOT happen during runtime");
         Err(ClockError::ClockNotSupported)
     }
     fn get_clock_rate(&self) -> Result<u32, ClockError> {
@@ -1119,7 +1123,6 @@ impl ConfigurableClock for MainClkConfig {
         Ok(rate)
     }
     fn set_clock_rate(&mut self, _div: u8, _mult: u8, _freq: u32) -> Result<(), ClockError> {
-        error!("The multi-source set_clock_rate_and_source method should be used instead of set_clock_rate");
         Err(ClockError::ClockNotSupported)
     }
     fn is_enabled(&self) -> bool {
@@ -1133,20 +1136,22 @@ impl ConfigurableClock for ClkInConfig {
         Ok(())
     }
     fn disable(&self) -> Result<(), ClockError> {
-        error!("Attempting to reset a clock input");
         Err(ClockError::ClockNotSupported)
     }
     fn get_clock_rate(&self) -> Result<u32, ClockError> {
-        if self.freq.is_some() {
-            Ok(self.freq.as_ref().unwrap().load(Ordering::Relaxed))
+        if let Some(cur_freq) = &self.freq {
+            Ok(cur_freq.load(Ordering::Relaxed))
         } else {
             Err(ClockError::ClockNotEnabled)
         }
     }
     fn set_clock_rate(&mut self, _div: u8, _mult: u8, freq: u32) -> Result<(), ClockError> {
-        trace!("Setting value of clk in config, this won't change the clock itself");
-        self.freq.as_ref().unwrap().store(freq, Ordering::Relaxed);
-        Ok(())
+        if let Some(cur_freq) = &self.freq {
+            cur_freq.store(freq, Ordering::Relaxed);
+            Ok(())
+        } else {
+            Err(ClockError::ClockNotEnabled)
+        }
     }
     fn is_enabled(&self) -> bool {
         self.state == State::Enabled
@@ -1187,7 +1192,6 @@ impl ConfigurableClock for RtcClkConfig {
         Ok(())
     }
     fn disable(&self) -> Result<(), ClockError> {
-        error!("Resetting the RTC clock, this should NOT happen during runtime");
         Err(ClockError::ClockNotSupported)
     }
     fn set_clock_rate(&mut self, _div: u8, _mult: u8, freq: u32) -> Result<(), ClockError> {
@@ -1198,7 +1202,6 @@ impl ConfigurableClock for RtcClkConfig {
             match r {
                 RtcFreq::Default1Hz => {
                     if rtc.ctrl().read().rtc_en().is_enable() {
-                        trace!("Attempting to enable an already enabled clock, RTC 1Hz");
                     } else {
                         rtc.ctrl().modify(|_r, w| w.rtc_en().enable());
                     }
@@ -1206,7 +1209,6 @@ impl ConfigurableClock for RtcClkConfig {
                 }
                 RtcFreq::HighResolution1khz => {
                     if rtc.ctrl().read().rtc1khz_en().is_enable() {
-                        trace!("Attempting to enable an already enabled clock, RTC 1Hz");
                     } else {
                         rtc.ctrl().modify(|_r, w| w.rtc1khz_en().enable());
                     }
@@ -1214,7 +1216,6 @@ impl ConfigurableClock for RtcClkConfig {
                 }
                 RtcFreq::SubSecond32kHz => {
                     if rtc.ctrl().read().rtc_subsec_ena().is_enable() {
-                        trace!("Attempting to enable an already enabled clock, RTC 1Hz");
                     } else {
                         rtc.ctrl().modify(|_r, w| w.rtc_subsec_ena().enable());
                     }
@@ -1244,18 +1245,12 @@ impl ConfigurableClock for RtcClkConfig {
 
 impl SysClkConfig {
     /// Updates the system core clock frequency, SW concept used for systick
-    fn update_sys_core_clock(&self) {
-        trace!(
-            "System core clock has been updated to {:?}, this involves no HW reg writes",
-            self.sysclkfreq.load(Ordering::Relaxed)
-        );
-    }
+    fn update_sys_core_clock(&self) {}
 }
 
 impl ConfigurableClock for SysOscConfig {
     fn enable_and_reset(&self) -> Result<(), ClockError> {
         if self.state == State::Enabled {
-            trace!("SysOsc was already enabled");
             return Ok(());
         }
 
@@ -1307,8 +1302,23 @@ impl ConfigurableClock for SysOscConfig {
 }
 
 /// Method to delay for a certain number of microseconds given a clock rate
-pub fn delay_loop_clocks(usec: u64, freq_mhz: u64) {
-    let mut ticks = usec * freq_mhz / 1_000_000 / 4;
+///
+/// Given `usec` and `freq_hz`, this method will compute the number of
+/// ticks to be passed to `cortex_m::asm::delay()` such that we reach
+/// the amount of microseconds requested by the caller.
+pub fn delay_loop_clocks(usec: u64, freq_hz: u64) {
+    // NOTICE: The correct math would be:
+    //
+    //     usec * 1_000 / 1_000_000_000 / freq_hz
+    //
+    // Which simplifies to:
+    //
+    //     usec * freq_hz / 1_000_000;
+    //
+    // However, testing shows that we're always about 50% over the
+    // requested target. Adding that extra 50% to the divisor gets us
+    // very close to what was requested.
+    let mut ticks = usec * freq_hz / 1_500_000;
     if ticks > u64::from(u32::MAX) {
         ticks = u64::from(u32::MAX);
     }
@@ -1334,12 +1344,13 @@ fn set_pad_voltage_range() {
 }
 
 /// Initialize AHB clock
-fn init_syscpuahb_clk() {
+fn init_syscpuahb_clk(divisor: u16) {
     // SAFETY: unsafe needed to take pointer to Clkctl0
     let clkctl0 = unsafe { crate::pac::Clkctl0::steal() };
     // SAFETY: unsafe needed to write the bits
-    // Set syscpuahbclkdiv to value 2, Subtract 1 since 0-> 1, 1-> 2, etc...
-    clkctl0.syscpuahbclkdiv().write(|w| unsafe { w.div().bits(2 - 1) });
+    clkctl0
+        .syscpuahbclkdiv()
+        .write(|w| unsafe { w.div().bits(divisor.saturating_sub(1) as u8) });
 
     while clkctl0.syscpuahbclkdiv().read().reqflag().bit_is_set() {}
 }
@@ -1495,35 +1506,21 @@ impl ClockOutConfig {
 
 /// Using the config, enables all desired clocks to desired clock rates
 fn init_clock_hw(config: ClockConfig) -> Result<(), ClockError> {
-    if let Err(e) = config.rtc.enable_and_reset() {
-        error!("couldn't Power on OSC for RTC, result: {:?}", e);
-        return Err(e);
-    }
+    config.rtc.enable_and_reset()?;
+    config.lposc.enable_and_reset()?;
+    config.ffro.enable_and_reset()?;
+    config.sfro.enable_and_reset()?;
+    config.sys_osc.enable_and_reset()?;
 
-    if let Err(e) = config.lposc.enable_and_reset() {
-        error!("couldn't Power on LPOSC, result: {:?}", e);
-        return Err(e);
-    }
+    // Switch the main clock source to FFRO divided by 4 (the reset default).
+    // This is done in case a bootloader already configured the main clock to use the PLL.
+    // We must make sure we're not using the PLL as main clock source while we reset it.
+    //
+    // We already switched on the FFRO clock above, in case the bootloader turned it off,
+    // so this should be fine.
+    MainClkConfig::reset_main_clk();
 
-    if let Err(e) = config.ffro.enable_and_reset() {
-        error!("couldn't Power on FFRO, result: {:?}", e);
-        return Err(e);
-    }
-
-    if let Err(e) = config.sfro.enable_and_reset() {
-        error!("couldn't Power on SFRO, result: {:?}", e);
-        return Err(e);
-    }
-
-    if let Err(e) = config.sys_osc.enable_and_reset() {
-        error!("Couldn't enable sys oscillator {:?}", e);
-        return Err(e);
-    }
-
-    if let Err(e) = config.main_pll_clk.enable_and_reset() {
-        error!("Couldn't enable main pll clock {:?}", e);
-        return Err(e);
-    }
+    config.main_pll_clk.enable_and_reset()?;
 
     // Move FLEXSPI clock source from main clock to FFRO to avoid instruction/data fetch issue in XIP when
     // updating PLL and main clock.
@@ -1537,12 +1534,13 @@ fn init_clock_hw(config: ClockConfig) -> Result<(), ClockError> {
         cc0.espiclksel().write(|w| w.sel().use_48_60m());
     }
 
-    init_syscpuahb_clk();
+    // Increase divisor to safe value.
+    init_syscpuahb_clk(256);
 
-    if let Err(e) = config.main_clk.enable_and_reset() {
-        error!("Couldn't enable main clock {:?}", e);
-        return Err(e);
-    }
+    config.main_clk.enable_and_reset()?;
+
+    // Set divisor to final value.
+    init_syscpuahb_clk(config.main_clk.div_int.load(Ordering::Relaxed) as u16);
 
     config.sys_clk.update_sys_core_clock();
     Ok(())
@@ -1559,7 +1557,8 @@ pub(crate) unsafe fn init(config: ClockConfig) -> Result<(), ClockError> {
 
 ///Trait to expose perph clocks
 trait SealedSysconPeripheral {
-    fn enable_and_reset_perph_clock();
+    fn enable_perph_clock();
+    fn reset_perph();
     fn disable_perph_clock();
 }
 
@@ -1572,7 +1571,18 @@ pub trait SysconPeripheral: SealedSysconPeripheral + 'static {}
 ///
 /// Peripheral must not be in use.
 pub fn enable_and_reset<T: SysconPeripheral>() {
-    T::enable_and_reset_perph_clock();
+    T::enable_perph_clock();
+    T::reset_perph();
+}
+
+/// Enables peripheral `T`.
+pub fn enable<T: SysconPeripheral>() {
+    T::enable_perph_clock();
+}
+
+/// Reset peripheral `T`.
+pub fn reset<T: SysconPeripheral>() {
+    T::reset_perph();
 }
 
 /// Disables peripheral `T`.
@@ -1586,15 +1596,21 @@ pub fn disable<T: SysconPeripheral>() {
 macro_rules! impl_perph_clk {
     ($peripheral:ident, $clkctl:ident, $clkreg:ident, $rstctl:ident, $rstreg:ident, $bit:expr) => {
         impl SealedSysconPeripheral for crate::peripherals::$peripheral {
-            fn enable_and_reset_perph_clock() {
+            fn enable_perph_clock() {
                 // SAFETY: unsafe needed to take pointers to Rstctl1 and Clkctl1
                 let cc1 = unsafe { pac::$clkctl::steal() };
-                let rc1 = unsafe { pac::$rstctl::steal() };
 
                 paste! {
                     // SAFETY: unsafe due to the use of bits()
                     cc1.[<$clkreg _set>]().write(|w| unsafe { w.bits(1 << $bit) });
+                }
+            }
 
+            fn reset_perph() {
+                // SAFETY: unsafe needed to take pointers to Rstctl1 and Clkctl1
+                let rc1 = unsafe { pac::$rstctl::steal() };
+
+                paste! {
                     // SAFETY: unsafe due to the use of bits()
                     rc1.[<$rstreg _clr>]().write(|w| unsafe { w.bits(1 << $bit) });
                 }
@@ -1603,12 +1619,8 @@ macro_rules! impl_perph_clk {
             fn disable_perph_clock() {
                 // SAFETY: unsafe needed to take pointers to Rstctl1 and Clkctl1
                 let cc1 = unsafe { pac::$clkctl::steal() };
-                let rc1 = unsafe { pac::$rstctl::steal() };
 
                 paste! {
-                    // SAFETY: unsafe due to the use of bits()
-                    rc1.[<$rstreg _set>]().write(|w| unsafe { w.bits(1 << $bit) });
-
                     // SAFETY: unsafe due to the use of bits()
                     cc1.[<$clkreg _clr>]().write(|w| unsafe { w.bits(1 << $bit) });
                 }

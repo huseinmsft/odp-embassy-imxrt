@@ -1,14 +1,12 @@
 #![no_std]
 #![no_main]
 
-extern crate embassy_imxrt_examples;
-
 use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_imxrt::i2c;
 use embassy_time::Timer;
 use embedded_hal_1::i2c::I2c;
-use {defmt_rtt as _, panic_probe as _};
+use {defmt_rtt as _, embassy_imxrt_examples as _, panic_probe as _};
 
 const ACC_ADDR: u8 = 0x1E;
 
@@ -37,7 +35,6 @@ async fn main(_spawner: Spawner) {
 
     // Acc is connected to P0_18_FC2_SCL and P0_17_FC2_SDA for I2C
     // Acc RESET gpio is P1_7_RST
-    info!("i2c example - embassy_imxrt::init");
     let p = embassy_imxrt::init(Default::default());
 
     info!("i2c example - Configure GPIOs");

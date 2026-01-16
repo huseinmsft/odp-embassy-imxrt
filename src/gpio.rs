@@ -1,6 +1,5 @@
 //! GPIO
 
-use core::convert::Infallible;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin as FuturePin;
@@ -13,10 +12,18 @@ use sealed::Sealed;
 use crate::clocks::enable_and_reset;
 use crate::iopctl::IopctlPin;
 pub use crate::iopctl::{AnyPin, DriveMode, DriveStrength, Function, Inverter, Pull, SlewRate};
-use crate::{interrupt, peripherals, Peri, PeripheralType};
+use crate::{Peri, PeripheralType, interrupt, peripherals};
 
 // This should be unique per IMXRT package
 const PORT_COUNT: usize = 8;
+
+/// GPIO error.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Error {
+    /// An invalid port or pin was provided, or a waker does not exist for the provided pin/port.
+    Invalid,
+}
 
 /// Digital input or output level.
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
@@ -85,11 +92,11 @@ impl Iterator for BitIter {
 fn irq_handler(port_wakers: &[Option<&PortWaker>]) {
     let reg = unsafe { crate::pac::Gpio::steal() };
 
-    for (port, port_waker) in port_wakers.iter().enumerate() {
-        if port_waker.is_none() {
-            continue;
-        }
-
+    for (port, port_waker) in port_wakers
+        .iter()
+        .enumerate()
+        .filter_map(|(port, &waker)| waker.map(|waker| (port, waker)))
+    {
         let stat = reg.intstata(port).read().bits();
         for pin in BitIter(stat) {
             // Clear the interrupt from this pin
@@ -98,7 +105,7 @@ fn irq_handler(port_wakers: &[Option<&PortWaker>]) {
             reg.intena(port)
                 .modify(|r, w| unsafe { w.int_en().bits(r.int_en().bits() & !(1 << pin)) });
 
-            if let Some(waker) = port_waker.unwrap().get_waker(pin as usize) {
+            if let Some(waker) = port_waker.get_waker(pin as usize) {
                 waker.wake();
             }
         }
@@ -290,35 +297,35 @@ impl<'d> Flex<'d, SenseEnabled> {
 
     /// Wait until the pin is high. If it is already high, return immediately.
     #[inline]
-    pub async fn wait_for_high(&mut self) {
-        InputFuture::new(self.pin.reborrow(), InterruptType::Level, Level::High).await;
+    pub fn wait_for_high(&mut self) -> InputFuture<'_> {
+        InputFuture::new(self.pin.reborrow(), InterruptType::Level, Level::High)
     }
 
     /// Wait until the pin is low. If it is already low, return immediately.
     #[inline]
-    pub async fn wait_for_low(&mut self) {
-        InputFuture::new(self.pin.reborrow(), InterruptType::Level, Level::Low).await;
+    pub fn wait_for_low(&mut self) -> InputFuture<'_> {
+        InputFuture::new(self.pin.reborrow(), InterruptType::Level, Level::Low)
     }
 
     /// Wait for the pin to undergo a transition from low to high.
     #[inline]
-    pub async fn wait_for_rising_edge(&mut self) {
-        InputFuture::new(self.pin.reborrow(), InterruptType::Edge, Level::High).await;
+    pub fn wait_for_rising_edge(&mut self) -> InputFuture<'_> {
+        InputFuture::new(self.pin.reborrow(), InterruptType::Edge, Level::High)
     }
 
     /// Wait for the pin to undergo a transition from high to low.
     #[inline]
-    pub async fn wait_for_falling_edge(&mut self) {
-        InputFuture::new(self.pin.reborrow(), InterruptType::Edge, Level::Low).await;
+    pub fn wait_for_falling_edge(&mut self) -> InputFuture<'_> {
+        InputFuture::new(self.pin.reborrow(), InterruptType::Edge, Level::Low)
     }
 
     /// Wait for the pin to undergo any transition, i.e low to high OR high to low.
     #[inline]
-    pub async fn wait_for_any_edge(&mut self) {
+    pub fn wait_for_any_edge(&mut self) -> InputFuture<'_> {
         if self.is_high() {
-            InputFuture::new(self.pin.reborrow(), InterruptType::Edge, Level::Low).await;
+            InputFuture::new(self.pin.reborrow(), InterruptType::Edge, Level::Low)
         } else {
-            InputFuture::new(self.pin.reborrow(), InterruptType::Edge, Level::High).await;
+            InputFuture::new(self.pin.reborrow(), InterruptType::Edge, Level::High)
         }
     }
 
@@ -357,6 +364,15 @@ impl<'d> Flex<'d, SenseDisabled> {
     }
 }
 
+/// # Safety
+/// There's nothing that ties the Flex to a specific thread or interrupt.
+/// We need to impl this manually because an UnsafeCell is used which is not Send by default.
+unsafe impl<'d, S: Sense> core::marker::Send for Flex<'d, S> {}
+/// # Safety
+/// All non-mut operations are atomic thanks to the hardware having set and clear registers.
+/// We need to impl this manually because an UnsafeCell is used which is not Sync by default.
+unsafe impl<'d, S: Sense> core::marker::Sync for Flex<'d, S> {}
+
 /// Input pin
 pub struct Input<'d> {
     pin: Flex<'d, SenseEnabled>,
@@ -390,37 +406,38 @@ impl<'d> Input<'d> {
 
     /// Wait until the pin is high. If it is already high, return immediately.
     #[inline]
-    pub async fn wait_for_high(&mut self) {
-        self.pin.wait_for_high().await;
+    pub fn wait_for_high(&mut self) -> InputFuture<'_> {
+        self.pin.wait_for_high()
     }
 
     /// Wait until the pin is low. If it is already low, return immediately.
     #[inline]
-    pub async fn wait_for_low(&mut self) {
-        self.pin.wait_for_low().await;
+    pub fn wait_for_low(&mut self) -> InputFuture<'_> {
+        self.pin.wait_for_low()
     }
 
     /// Wait for the pin to undergo a transition from low to high.
     #[inline]
-    pub async fn wait_for_rising_edge(&mut self) {
-        self.pin.wait_for_rising_edge().await;
+    pub fn wait_for_rising_edge(&mut self) -> InputFuture<'_> {
+        self.pin.wait_for_rising_edge()
     }
 
     /// Wait for the pin to undergo a transition from high to low.
     #[inline]
-    pub async fn wait_for_falling_edge(&mut self) {
-        self.pin.wait_for_falling_edge().await;
+    pub fn wait_for_falling_edge(&mut self) -> InputFuture<'_> {
+        self.pin.wait_for_falling_edge()
     }
 
     /// Wait for the pin to undergo any transition, i.e low to high OR high to low.
     #[inline]
-    pub async fn wait_for_any_edge(&mut self) {
-        self.pin.wait_for_any_edge().await;
+    pub fn wait_for_any_edge(&mut self) -> InputFuture<'_> {
+        self.pin.wait_for_any_edge()
     }
 }
 
+/// A gpio future to be awaited
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-struct InputFuture<'d> {
+pub struct InputFuture<'d> {
     pin: Peri<'d, AnyPin>,
 }
 
@@ -452,35 +469,24 @@ impl<'d> InputFuture<'d> {
 }
 
 impl Future for InputFuture<'_> {
-    type Output = ();
+    type Output = Result<(), Error>;
 
     fn poll(self: FuturePin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // We need to register/re-register the waker for each poll because any
-        // calls to wake will deregister the waker.
-        if self.pin.port() >= GPIO_WAKERS.len() {
-            panic!("Invalid GPIO port index {}", self.pin.port());
-        }
-
-        let port_waker = GPIO_WAKERS[self.pin.port()];
-        if port_waker.is_none() {
-            panic!("Waker not present for GPIO port {}", self.pin.port());
-        }
-
-        let waker = port_waker.unwrap().get_waker(self.pin.pin());
-        if waker.is_none() {
-            panic!(
-                "Waker not present for GPIO pin {}, port {}",
-                self.pin.pin(),
-                self.pin.port()
-            );
-        }
-        waker.unwrap().register(cx.waker());
-
-        // Double check that the pin interrut has been disabled by IRQ handler
-        if self.pin.block().intena(self.pin.port()).read().bits() & (1 << self.pin.pin()) == 0 {
-            Poll::Ready(())
+        if let Some(index) = GPIO_WAKERS.get(self.pin.port())
+            && let Some(port_waker) = index
+            && let Some(waker) = port_waker.get_waker(self.pin.pin())
+        {
+            // We need to register/re-register the waker for each poll because any
+            // calls to wake will deregister the waker.
+            waker.register(cx.waker());
+            // Double check that the pin interrut has been disabled by IRQ handler
+            if self.pin.block().intena(self.pin.port()).read().bits() & (1 << self.pin.pin()) == 0 {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
         } else {
-            Poll::Pending
+            Poll::Ready(Err(Error::Invalid))
         }
     }
 }
@@ -797,7 +803,7 @@ static GPIO_WAKERS: [Option<&PortWaker>; PORT_COUNT] = [
 ];
 
 impl embedded_hal_02::digital::v2::InputPin for Flex<'_, SenseEnabled> {
-    type Error = Infallible;
+    type Error = Error;
 
     #[inline]
     fn is_high(&self) -> Result<bool, Self::Error> {
@@ -811,7 +817,7 @@ impl embedded_hal_02::digital::v2::InputPin for Flex<'_, SenseEnabled> {
 }
 
 impl<S: Sense> embedded_hal_02::digital::v2::OutputPin for Flex<'_, S> {
-    type Error = Infallible;
+    type Error = Error;
 
     #[inline]
     fn set_high(&mut self) -> Result<(), Self::Error> {
@@ -839,7 +845,7 @@ impl embedded_hal_02::digital::v2::StatefulOutputPin for Flex<'_, SenseEnabled> 
 }
 
 impl<S: Sense> embedded_hal_02::digital::v2::ToggleableOutputPin for Flex<'_, S> {
-    type Error = Infallible;
+    type Error = Error;
 
     #[inline]
     fn toggle(&mut self) -> Result<(), Self::Error> {
@@ -849,7 +855,7 @@ impl<S: Sense> embedded_hal_02::digital::v2::ToggleableOutputPin for Flex<'_, S>
 }
 
 impl embedded_hal_02::digital::v2::InputPin for Input<'_> {
-    type Error = Infallible;
+    type Error = Error;
 
     #[inline]
     fn is_high(&self) -> Result<bool, Self::Error> {
@@ -863,7 +869,7 @@ impl embedded_hal_02::digital::v2::InputPin for Input<'_> {
 }
 
 impl embedded_hal_02::digital::v2::OutputPin for Output<'_> {
-    type Error = Infallible;
+    type Error = Error;
 
     #[inline]
     fn set_high(&mut self) -> Result<(), Self::Error> {
@@ -891,7 +897,7 @@ impl embedded_hal_02::digital::v2::StatefulOutputPin for Output<'_> {
 }
 
 impl embedded_hal_02::digital::v2::ToggleableOutputPin for Output<'_> {
-    type Error = Infallible;
+    type Error = Error;
 
     #[inline]
     fn toggle(&mut self) -> Result<(), Self::Error> {
@@ -900,8 +906,14 @@ impl embedded_hal_02::digital::v2::ToggleableOutputPin for Output<'_> {
     }
 }
 
+impl embedded_hal_1::digital::Error for Error {
+    fn kind(&self) -> embedded_hal_1::digital::ErrorKind {
+        embedded_hal_1::digital::ErrorKind::Other
+    }
+}
+
 impl<S: Sense> embedded_hal_1::digital::ErrorType for Flex<'_, S> {
-    type Error = Infallible;
+    type Error = Error;
 }
 
 impl embedded_hal_1::digital::InputPin for Flex<'_, SenseEnabled> {
@@ -945,40 +957,35 @@ impl embedded_hal_1::digital::StatefulOutputPin for Flex<'_, SenseEnabled> {
     }
 }
 
-impl<'d> embedded_hal_async::digital::Wait for Flex<'d, SenseEnabled> {
+impl embedded_hal_async::digital::Wait for Flex<'_, SenseEnabled> {
     #[inline]
     async fn wait_for_high(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_high().await;
-        Ok(())
+        self.wait_for_high().await
     }
 
     #[inline]
     async fn wait_for_low(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_low().await;
-        Ok(())
+        self.wait_for_low().await
     }
 
     #[inline]
     async fn wait_for_rising_edge(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_rising_edge().await;
-        Ok(())
+        self.wait_for_rising_edge().await
     }
 
     #[inline]
     async fn wait_for_falling_edge(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_falling_edge().await;
-        Ok(())
+        self.wait_for_falling_edge().await
     }
 
     #[inline]
     async fn wait_for_any_edge(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_any_edge().await;
-        Ok(())
+        self.wait_for_any_edge().await
     }
 }
 
 impl embedded_hal_1::digital::ErrorType for Input<'_> {
-    type Error = Infallible;
+    type Error = Error;
 }
 
 impl embedded_hal_1::digital::InputPin for Input<'_> {
@@ -993,40 +1000,35 @@ impl embedded_hal_1::digital::InputPin for Input<'_> {
     }
 }
 
-impl<'d> embedded_hal_async::digital::Wait for Input<'d> {
+impl embedded_hal_async::digital::Wait for Input<'_> {
     #[inline]
     async fn wait_for_high(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_high().await;
-        Ok(())
+        self.wait_for_high().await
     }
 
     #[inline]
     async fn wait_for_low(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_low().await;
-        Ok(())
+        self.wait_for_low().await
     }
 
     #[inline]
     async fn wait_for_rising_edge(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_rising_edge().await;
-        Ok(())
+        self.wait_for_rising_edge().await
     }
 
     #[inline]
     async fn wait_for_falling_edge(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_falling_edge().await;
-        Ok(())
+        self.wait_for_falling_edge().await
     }
 
     #[inline]
     async fn wait_for_any_edge(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_any_edge().await;
-        Ok(())
+        self.wait_for_any_edge().await
     }
 }
 
 impl embedded_hal_1::digital::ErrorType for Output<'_> {
-    type Error = Infallible;
+    type Error = Error;
 }
 
 impl embedded_hal_1::digital::OutputPin for Output<'_> {

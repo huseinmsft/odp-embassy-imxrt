@@ -3,16 +3,16 @@
 
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_imxrt::flexspi_nor_storage_bus::{
-    AhbConfig, FlexSpiBusWidth, FlexSpiFlashPort, FlexSpiFlashPortDeviceInstance, FlexspiAhbBufferConfig,
-    FlexspiConfig, FlexspiDeviceConfig, FlexspiNorStorageBus,
+use embassy_imxrt::flexspi::nor_storage_bus::{
+    AhbConfig, FlexSpiFlashPort, FlexSpiFlashPortDeviceInstance, FlexspiAhbBufferConfig, FlexspiConfig,
+    FlexspiConfigPortData, FlexspiDeviceConfig, FlexspiNorStorageBus,
 };
-use embassy_imxrt::pac::flexspi::ahbcr::*;
-use embassy_imxrt::pac::flexspi::flshcr1::*;
-use embassy_imxrt::pac::flexspi::flshcr2::*;
-use embassy_imxrt::pac::flexspi::flshcr4::*;
-use embassy_imxrt::pac::flexspi::mcr0::*;
-use embassy_imxrt::pac::flexspi::mcr2::*;
+use embassy_imxrt::pac::flexspi::ahbcr::{Bufferableen, Cachableen, Readaddropt};
+use embassy_imxrt::pac::flexspi::flshcr1::Csintervalunit;
+use embassy_imxrt::pac::flexspi::flshcr2::Awrwaitunit;
+use embassy_imxrt::pac::flexspi::flshcr4::{Wmena, Wmenb};
+use embassy_imxrt::pac::flexspi::mcr0::{Dozeen, Hsen, Rxclksrc, Sckfreerunen};
+use embassy_imxrt::pac::flexspi::mcr2::{Clrahbbufopt, Samedeviceen, Sckbdiffopt};
 use embassy_time::Timer;
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash as BlockingNorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash as BlockingReadNorFlash,
@@ -30,7 +30,8 @@ mod sealed {
     pub trait Sealed {}
 }
 
-impl<T> sealed::Sealed for T {}
+impl sealed::Sealed for Blocking {}
+impl sealed::Sealed for Async {}
 
 /// Driver mode.
 #[allow(private_bounds)]
@@ -165,11 +166,11 @@ impl<T: BlockingNorStorageBusDriver> BlockingNorFlash for MacronixDeviceDriver<T
             return Err(NorErrorType::FlashStorageErrorOutOfBounds);
         }
 
-        if from % Self::ERASE_SIZE as u32 != 0 {
+        if !from.is_multiple_of(Self::ERASE_SIZE as u32) {
             return Err(NorErrorType::FlashStorageErrorNotAligned);
         }
 
-        if to % Self::ERASE_SIZE as u32 != 0 {
+        if !to.is_multiple_of(Self::ERASE_SIZE as u32) {
             return Err(NorErrorType::FlashStorageErrorNotAligned);
         }
 
@@ -397,27 +398,29 @@ async fn main(_spawner: Spawner) {
         enable_same_config_for_all: Samedeviceen::Samedeviceen0,
         seq_timeout_cycle: 0xFFFF,
         ip_grant_timeout_cycle: 0xff,
-        tx_watermark: 0x08,
-        rx_watermark: 0x08,
         ahb_config,
     };
 
-    let mut flexspi_storage = FlexspiNorStorageBus::new_blocking(
-        p.FLEXSPI,       // FlexSPI peripheral
-        Some(p.PIO1_11), // FlexSPI DATA 0 pin
-        Some(p.PIO1_12),
-        Some(p.PIO1_13),
-        Some(p.PIO1_14),
-        Some(p.PIO2_17),
-        Some(p.PIO2_18),
-        Some(p.PIO2_22),
-        Some(p.PIO2_23),
+    let mut flexspi_storage = FlexspiNorStorageBus::new_blocking_octal_config(
+        p.FLEXSPI, // FlexSPI peripheral
+        p.PIO1_11,
+        p.PIO1_12,
+        p.PIO1_13,
+        p.PIO1_14,
+        p.PIO2_17,
+        p.PIO2_18,
+        p.PIO2_22,
+        p.PIO2_23,
         p.PIO1_29,
         p.PIO2_19,
-        FlexSpiFlashPort::PortB,                         // FlexSPI port
-        FlexSpiBusWidth::Octal,                          // FlexSPI bus width
-        FlexSpiFlashPortDeviceInstance::DeviceInstance0, // FlexSPI device instance
-    );
+        FlexspiConfigPortData {
+            port: FlexSpiFlashPort::PortB,                                 // FlexSPI port
+            dev_instance: FlexSpiFlashPortDeviceInstance::DeviceInstance0, // FlexSPI device instance
+            rx_watermark: 0x8,
+            tx_watermark: 0x8,
+        },
+    )
+    .unwrap_or_else(|_| panic!("Invalid config"));
 
     // Configure the Flexspi controller
     let _ = flexspi_storage.configport.configure_flexspi(&flexspi_config); // Configure the Flexspi controller

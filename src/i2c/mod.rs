@@ -1,6 +1,6 @@
 //! Implements I2C function support over flexcomm + gpios
 
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::Poll;
@@ -10,7 +10,7 @@ use paste::paste;
 use sealed::Sealed;
 
 use crate::iopctl::IopctlPin as Pin;
-use crate::{dma, interrupt, PeripheralType};
+use crate::{PeripheralType, dma, interrupt};
 
 /// I2C Master Driver
 pub mod master;
@@ -68,12 +68,19 @@ impl<T: Pin> sealed::Sealed for T {}
 #[derive(Clone, Copy)]
 struct Info {
     regs: &'static crate::pac::i2c0::RegisterBlock,
-    index: usize,
+    waker: &'static AtomicWaker,
+    remediation: &'static AtomicU8,
 }
+
+// SAFETY: safety for Send here is the same as the other accessors to unsafe blocks: it must be done from a single executor context.
+//         This is a temporary workaround -- a better solution might be to refactor Info to no longer maintain a reference to regs,
+//         but instead look up the correct register set and then perform operations within an unsafe block as we do for other peripherals
+unsafe impl Send for Info {}
 
 trait SealedInstance {
     fn info() -> Info;
-    fn index() -> usize;
+    fn waker() -> &'static AtomicWaker;
+    fn remediation() -> &'static AtomicU8;
 }
 
 /// shared functions between master and slave operation
@@ -89,24 +96,25 @@ macro_rules! impl_instance {
             paste!{
                 impl SealedInstance for crate::peripherals::[<FLEXCOMM $n>] {
                     fn info() -> Info {
-                        let mut info_index = $n;
-                        if $n == 15 {
-                            info_index = 8;
-                        }
-
                         Info {
                             regs: unsafe { &*crate::pac::[<I2c $n>]::ptr() },
-                            index: info_index,
+                            waker: Self::waker(),
+                            remediation: Self::remediation(),
                         }
                     }
 
+                    #[inline]
+                    fn waker() -> &'static AtomicWaker {
+                        static WAKER: AtomicWaker = AtomicWaker::new();
+                        &WAKER
+                    }
 
                     #[inline]
-                    fn index() -> usize {
-                        if $n == 15 {
-                            return 8
-                        }
-                        $n
+                    fn remediation() -> &'static AtomicU8 {
+                        // Used in cases where there was a cancellation that needs to be cleaned up on the next
+                        // interrupt
+                        static REMEDIATION: AtomicU8 = AtomicU8::new(0);
+                        &REMEDIATION
                     }
                 }
 
@@ -120,12 +128,6 @@ macro_rules! impl_instance {
 
 impl_instance!(0, 1, 2, 3, 4, 5, 6, 7, 15);
 
-const I2C_COUNT: usize = 9;
-static I2C_WAKERS: [AtomicWaker; I2C_COUNT] = [const { AtomicWaker::new() }; I2C_COUNT];
-
-// Used in cases where there was a cancellation that needs to be cleaned up on the next
-// interrupt
-static I2C_REMEDIATION: [AtomicU8; I2C_COUNT] = [const { AtomicU8::new(0) }; I2C_COUNT];
 const REMEDIATON_NONE: u8 = 0b0000_0000;
 const REMEDIATON_MASTER_STOP: u8 = 0b0000_0001;
 const REMEDIATON_SLAVE_NAK: u8 = 0b0000_0010;
@@ -137,23 +139,21 @@ const REMEDIATON_SLAVE_NAK: u8 = 0b0000_0010;
 /// 2. We cancel that operation, without sending STOP, so a remediation is requested
 /// 3. BEFORE the remediation completes, we create a blocking peripheral
 fn force_clear_remediation(info: &Info) {
-    I2C_REMEDIATION[info.index].store(REMEDIATON_NONE, Ordering::Release);
+    info.remediation.store(REMEDIATON_NONE, Ordering::Release);
 }
 
 /// Await the remediation step being completed by the interrupt, after
 /// a previous cancellation
-async fn wait_remediation_complete(info: &Info) {
-    let index = info.index;
-    poll_fn(|cx| {
-        I2C_WAKERS[index].register(cx.waker());
-        let rem = I2C_REMEDIATION[index].load(Ordering::Acquire);
+fn wait_remediation_complete(info: &Info) -> impl Future<Output = ()> {
+    poll_fn(move |cx| {
+        info.waker.register(cx.waker());
+        let rem = info.remediation.load(Ordering::Acquire);
         if rem == REMEDIATON_NONE {
             Poll::Ready(())
         } else {
             Poll::Pending
         }
     })
-    .await;
 }
 
 /// Ten bit addresses start with first byte 0b11110XXX
@@ -166,13 +166,11 @@ pub struct InterruptHandler<T: Instance> {
 
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
-        let waker = &I2C_WAKERS[T::index()];
-
         let i2c = T::info().regs;
 
         if i2c.intstat().read().mstpending().bit_is_set() {
             // Retrieve and mask off the remediation flags
-            let rem = I2C_REMEDIATION[T::index()].fetch_and(!REMEDIATON_MASTER_STOP, Ordering::AcqRel);
+            let rem = T::remediation().fetch_and(!REMEDIATON_MASTER_STOP, Ordering::AcqRel);
 
             if (rem & REMEDIATON_MASTER_STOP) != 0 {
                 i2c.mstctl().write(|w| w.mststop().set_bit());
@@ -191,7 +189,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 
         if i2c.intstat().read().slvpending().bit_is_set() {
             // Retrieve and mask off the remediation flags
-            let rem = I2C_REMEDIATION[T::index()].fetch_and(!REMEDIATON_SLAVE_NAK, Ordering::AcqRel);
+            let rem = T::remediation().fetch_and(!REMEDIATON_SLAVE_NAK, Ordering::AcqRel);
 
             if (rem & REMEDIATON_SLAVE_NAK) != 0 {
                 i2c.slvctl().write(|w| w.slvnack().set_bit());
@@ -203,7 +201,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             i2c.intenclr().write(|w| w.slvdeselclr().set_bit());
         }
 
-        waker.wake();
+        T::waker().wake();
     }
 }
 
@@ -318,9 +316,9 @@ impl_sda!(PIO1_5, F1, FLEXCOMM5);
 impl_sda!(PIO1_6, F1, FLEXCOMM5);
 impl_scl!(PIO1_7, F1, FLEXCOMM5);
 
-impl_scl!(PIO3_16, F4, FLEXCOMM5);
-impl_sda!(PIO3_17, F4, FLEXCOMM5);
-impl_sda!(PIO3_18, F4, FLEXCOMM5);
+impl_scl!(PIO3_16, F5, FLEXCOMM5);
+impl_sda!(PIO3_17, F5, FLEXCOMM5);
+impl_sda!(PIO3_18, F5, FLEXCOMM5);
 impl_scl!(PIO3_22, F5, FLEXCOMM5);
 
 // Flexcomm6 GPIOs -
